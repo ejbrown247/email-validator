@@ -5,15 +5,28 @@ An SMTP 250 response does not prove mailbox existence. No DATA is sent.
 import csv
 import secrets
 import smtplib
-import socket
-import time
 from pathlib import Path
-from email_validator import validate_email, EmailSyntaxError, EmailUndeliverableError
+from email_validator import validate_email, EmailSyntaxError
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, PatternFill
 import dns.resolver
 
 TIMEOUT = 6
+
+PLAIN_ENGLISH = {
+    'MISSING': 'No email address was provided.',
+    'INVALID SYNTAX': 'This email address has a formatting problem. Check it for typing mistakes.',
+    'NO MAIL ROUTING': 'This email domain does not appear able to receive email. Check the part after @.',
+    'DOMAIN ACCEPTS MAIL': 'The email domain can receive mail, but this particular address has not been verified.',
+    'MAILBOX REJECTED': 'The mail server says this mailbox does not exist. Check the address with the person.',
+    'ACCEPTED (UNCONFIRMED)': 'The mail server accepted the address, but this does not prove the mailbox exists.',
+    'CATCH-ALL / UNKNOWN': 'The mail server also accepts made-up addresses, so we cannot tell whether this mailbox exists.',
+    'INCONCLUSIVE': 'We could not verify this address. It might still be valid.',
+    'NOT TESTED': 'The mailbox was not tested.',
+}
+
+def plain_english_meaning(status):
+    return PLAIN_ENGLISH.get(status, 'The result could not be interpreted automatically. Review the technical explanation.')
 
 def dns_check(address):
     address = str(address or '').strip()
@@ -35,7 +48,6 @@ def dns_check(address):
     except dns.resolver.NXDOMAIN:
         return normalized, 'NO MAIL ROUTING', 'Domain does not exist (NXDOMAIN)', []
     except dns.resolver.NoAnswer:
-        # SMTP permits A/AAAA fallback when no MX is published.
         try:
             dns.resolver.resolve(domain, 'A', lifetime=TIMEOUT)
             return normalized, 'DOMAIN ACCEPTS MAIL', 'No MX; A-record fallback exists; mailbox NOT verified', [domain]
@@ -53,10 +65,7 @@ def dns_check(address):
         return normalized, 'INCONCLUSIVE', f'DNS lookup inconclusive: {exc}', []
 
 def smtp_rcpt(host, recipient, timeout=TIMEOUT):
-    """Return (stage, SMTP code, reply). Never send DATA.
-
-    Stage is essential: a 550 at MAIL FROM does not reject the mailbox.
-    """
+    """Return (stage, SMTP code, reply). Never send DATA."""
     with smtplib.SMTP(timeout=timeout, local_hostname='localhost') as smtp:
         smtp.connect(host, 25)
         code, reply = smtp.ehlo_or_helo_if_needed() or (250, b'EHLO OK')
@@ -68,29 +77,22 @@ def smtp_rcpt(host, recipient, timeout=TIMEOUT):
         code, reply = smtp.rcpt(recipient)
         return 'RCPT TO', code, _reply_text(reply)
 
-
 def _reply_text(value):
     return value.decode('utf-8', 'replace') if isinstance(value, bytes) else str(value)
 
-
 def _probe_result(result):
-    """Support older two-field probes without mistaking their stage for RCPT."""
     if len(result) == 3:
         stage, code, reply = result
         return str(stage).upper(), int(code), _reply_text(reply)
     if len(result) == 2:
         code, reply = result
         reply = _reply_text(reply)
-        if 'MAIL FROM refused' in reply.upper() or 'MAIL FROM REFUSED' in reply.upper():
+        if 'MAIL FROM REFUSED' in reply.upper():
             return 'MAIL FROM', int(code), reply
-        # Legacy mock probes represent RCPT responses, but real probes should
-        # return an explicit stage to make a rejection defensible.
         return 'RCPT TO', int(code), reply
     raise ValueError('SMTP probe must return (stage, code, reply)')
 
-
 def _recipient_missing(code, reply):
-    """Conservatively recognize explicit unknown-recipient responses only."""
     if code not in (550, 551, 553):
         return False
     msg = reply.casefold()
@@ -105,9 +107,8 @@ def _recipient_missing(code, reply):
         'unknown recipient', 'recipient address rejected: user unknown',
         'no such mailbox', 'account that you tried to reach does not exist'))
 
-
 def smtp_check(address, hosts, probe=smtp_rcpt):
-    """Best effort. Acceptance is not proof of inbox existence."""
+    """Probe a recipient and preserve complete SMTP replies from both probes."""
     if not hosts:
         return 'NOT TESTED', 'No mail host available'
     domain = address.rsplit('@', 1)[-1]
@@ -116,29 +117,29 @@ def smtp_check(address, hosts, probe=smtp_rcpt):
         stage, code, reply = _probe_result(probe(host, address))
     except (OSError, smtplib.SMTPException, TimeoutError) as exc:
         return 'INCONCLUSIVE', f'SMTP connection/probe failed: {type(exc).__name__}: {exc}'
+    target_detail = f'Target SMTP {stage} ({code}): {reply}'
     if stage != 'RCPT TO':
-        return 'INCONCLUSIVE', f'SMTP {stage} rejected/failed ({code}): {reply}; recipient was not checked'
+        return 'INCONCLUSIVE', f'{target_detail}; recipient was not checked'
     if _recipient_missing(code, reply):
-        return 'MAILBOX REJECTED', f'SMTP RCPT TO {code}: {reply}'
+        return 'MAILBOX REJECTED', target_detail
     if code not in (250, 251):
-        return 'INCONCLUSIVE', f'SMTP RCPT TO {code}: {reply}; no definitive mailbox verdict'
+        return 'INCONCLUSIVE', f'{target_detail}; no definitive mailbox verdict'
 
     random_recipient = f'nonexistent-{secrets.token_hex(12)}@{domain}'
     try:
         random_stage, random_code, random_reply = _probe_result(probe(host, random_recipient))
     except (OSError, smtplib.SMTPException, TimeoutError) as exc:
-        return 'ACCEPTED (UNCONFIRMED)', f'Target accepted (SMTP RCPT TO {code}); catch-all test inconclusive: {exc}'
+        return 'ACCEPTED (UNCONFIRMED)', (f'{target_detail}; catch-all probe failed: '
+                f'{type(exc).__name__}: {exc}; mailbox NOT proven')
+    random_detail = f'Catch-all SMTP {random_stage} ({random_code}): {random_reply}'
+    detail = f'{target_detail}; {random_detail}'
     if random_stage != 'RCPT TO':
-        return 'ACCEPTED (UNCONFIRMED)', (f'Target accepted (SMTP RCPT TO {code}); '
-                f'catch-all probe blocked at {random_stage} ({random_code}); mailbox NOT proven')
+        return 'ACCEPTED (UNCONFIRMED)', f'{detail}; catch-all probe blocked; mailbox NOT proven'
     if random_code in (250, 251):
-        return 'CATCH-ALL / UNKNOWN', (f'Server accepted target and random recipient '
-                f'(SMTP {code}/{random_code}); mailbox NOT verified')
+        return 'CATCH-ALL / UNKNOWN', f'{detail}; server accepted a random recipient; mailbox NOT verified'
     if _recipient_missing(random_code, random_reply):
-        return 'ACCEPTED (UNCONFIRMED)', (f'Target accepted (SMTP {code}); random recipient '
-                f'explicitly rejected (SMTP {random_code}); mailbox NOT proven')
-    return 'ACCEPTED (UNCONFIRMED)', (f'Target accepted (SMTP {code}); catch-all check '
-            f'inconclusive (SMTP {random_code}: {random_reply}); mailbox NOT proven')
+        return 'ACCEPTED (UNCONFIRMED)', f'{detail}; random recipient explicitly rejected; mailbox NOT proven'
+    return 'ACCEPTED (UNCONFIRMED)', f'{detail}; catch-all check inconclusive; mailbox NOT proven'
 
 def check_address(address, use_smtp=False, probe=smtp_rcpt):
     normalized, status, explanation, hosts = dns_check(address)
@@ -179,14 +180,14 @@ def validate_file(source, destination, email_index, progress=None, use_smtp=Fals
     book = Workbook()
     sheet = book.active
     sheet.title = 'Validation'
-    sheet.append(headers + ['Normalized Email', 'Status', 'Explanation'])
+    sheet.append(headers + ['Normalized Email', 'Status', 'Plain English Meaning', 'Explanation'])
     cache, totals = {}, {}
     for i, row in enumerate(rows, start=1):
         key = str(row[email_index] or '').strip()
         if key not in cache:
             cache[key] = check_address(key, use_smtp=use_smtp)
         normalized, status, explanation = cache[key]
-        sheet.append(row + [normalized, status, explanation])
+        sheet.append(row + [normalized, status, plain_english_meaning(status), explanation])
         totals[status] = totals.get(status, 0) + 1
         if progress:
             progress(i, len(rows))
